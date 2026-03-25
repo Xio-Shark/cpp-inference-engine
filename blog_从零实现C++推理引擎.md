@@ -213,6 +213,6 @@ Triton 用 40 行 Python 就能达到 cuBLAS 96.7%，核心在于 `@triton.autot
 
 ---
 
-*完整代码：[GitHub 链接]*（替换为实际仓库地址）
+*完整代码：[GitHub - cpp-inference-engine](https://github.com/Xio-Shark/cpp-inference-engine)*
 
 *相关实验数据：AWQ INT4 量化 15.3→5.6GB（节省 63%）、vLLM TP=2 tensor parallel 验证、CUDA GEMM 两级优化 + Nsight Profiling*
