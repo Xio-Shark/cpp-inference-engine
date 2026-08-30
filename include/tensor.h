@@ -22,6 +22,16 @@ public:
     GpuTensor(const GpuTensor&) = delete;
     GpuTensor& operator=(const GpuTensor&) = delete;
 
+    /// Non-owning view into existing GPU memory
+    static GpuTensor from_borrowed(half* ptr, std::vector<int> shape, void* native_buf = nullptr) {
+        GpuTensor t;
+        t.data_ = ptr;
+        t.shape_ = std::move(shape);
+        t.owned_ = false;
+        t.native_buffer_ = native_buf;
+        return t;
+    }
+
     void load_from_host(const half* src, size_t n);
     void copy_to_host(half* dst, size_t n) const;
 

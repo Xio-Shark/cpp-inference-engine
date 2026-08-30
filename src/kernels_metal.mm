@@ -286,6 +286,93 @@ kernel void repeat_kv_kernel(
 
     out[idx] = in[(h / p.rep) * p.S * p.D + s * p.D + d];
 }
+
+// ===================== SwiGLU Fused Kernel =====================
+kernel void swiglu_kernel(
+    device half* out                  [[buffer(0)]],
+    device const half* gate           [[buffer(1)]],
+    device const half* up             [[buffer(2)]],
+    constant int& n                   [[buffer(3)]],
+    uint idx                          [[thread_position_in_grid]]
+) {
+    if (idx < uint(n)) {
+        float g = float(gate[idx]);
+        float u = float(up[idx]);
+        float silu_g = g / (1.0f + exp(-g));
+        out[idx] = half(silu_g * u);
+    }
+}
+
+// ===================== Fused Causal Softmax =====================
+kernel void fused_causal_softmax_kernel(
+    device half* scores               [[buffer(0)]],
+    constant int& S                   [[buffer(1)]],
+    uint row_idx                      [[threadgroup_position_in_grid]],
+    uint tid                          [[thread_position_in_threadgroup]],
+    uint threads_per_group            [[threads_per_threadgroup]]
+) {
+    int r = row_idx % S;
+    device half* row_ptr = scores + row_idx * S;
+    threadgroup float sm[256];
+
+    float mx = -1e30f;
+    for (int c = tid; c <= r; c += threads_per_group) {
+        mx = max(mx, float(row_ptr[c]));
+    }
+    sm[tid] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = threads_per_group >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            sm[tid] = max(sm[tid], sm[tid + s]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mv = sm[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float es = 0.0f;
+    for (int c = tid; c <= r; c += threads_per_group) {
+        es += exp(float(row_ptr[c]) - mv);
+    }
+    sm[tid] = es;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = threads_per_group >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            sm[tid] += sm[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = (sm[0] > 0.0f) ? (1.0f / sm[0]) : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int c = tid; c < S; c += threads_per_group) {
+        if (c <= r) {
+            row_ptr[c] = half(exp(float(row_ptr[c]) - mv) * inv_sum);
+        } else {
+            row_ptr[c] = half(0.0f);
+        }
+    }
+}
+
+// ===================== Fused Transpose & Repeat KV =====================
+kernel void transpose_and_repeat_kv_kernel(
+    device half* out                  [[buffer(0)]],
+    device const half* in             [[buffer(1)]],
+    constant RepeatKVParams& p        [[buffer(2)]],
+    uint idx                          [[thread_position_in_grid]]
+) {
+    int total = p.nkv * p.rep * p.S * p.D;
+    if (idx >= uint(total)) return;
+
+    int d = idx % p.D;
+    int s = (idx / p.D) % p.S;
+    int h = idx / (p.S * p.D);
+    int kv_h = h / p.rep;
+
+    out[idx] = in[s * (p.nkv * p.D) + kv_h * p.D + d];
+}
 )METAL";
 
 // ===================== DeviceContext Implementation =====================
@@ -305,6 +392,9 @@ public:
     id<MTLComputePipelineState> pso_mask;
     id<MTLComputePipelineState> pso_transpose;
     id<MTLComputePipelineState> pso_repeat;
+    id<MTLComputePipelineState> pso_swiglu;
+    id<MTLComputePipelineState> pso_fused_causal_softmax;
+    id<MTLComputePipelineState> pso_transpose_and_repeat_kv;
 
     DeviceContextImpl() {
         @autoreleasepool {
@@ -339,15 +429,18 @@ public:
             return pso;
         };
 
-        pso_rms_norm   = make_pso("rms_norm_kernel");
-        pso_rope       = make_pso("rope_kernel");
-        pso_silu       = make_pso("silu_kernel");
-        pso_mul        = make_pso("ewise_mul_kernel");
-        pso_add        = make_pso("ewise_add_kernel");
-        pso_softmax    = make_pso("softmax_rows_kernel");
-        pso_mask       = make_pso("causal_mask_kernel");
-        pso_transpose  = make_pso("transpose_012_to_102_kernel");
-        pso_repeat     = make_pso("repeat_kv_kernel");
+        pso_rms_norm                   = make_pso("rms_norm_kernel");
+        pso_rope                       = make_pso("rope_kernel");
+        pso_silu                       = make_pso("silu_kernel");
+        pso_mul                        = make_pso("ewise_mul_kernel");
+        pso_add                        = make_pso("ewise_add_kernel");
+        pso_softmax                    = make_pso("softmax_rows_kernel");
+        pso_mask                       = make_pso("causal_mask_kernel");
+        pso_transpose                  = make_pso("transpose_012_to_102_kernel");
+        pso_repeat                     = make_pso("repeat_kv_kernel");
+        pso_swiglu                     = make_pso("swiglu_kernel");
+        pso_fused_causal_softmax       = make_pso("fused_causal_softmax_kernel");
+        pso_transpose_and_repeat_kv   = make_pso("transpose_and_repeat_kv_kernel");
     }
 
     id<MTLCommandBuffer> get_or_create_command_buffer() {
@@ -558,6 +651,53 @@ void repeat_kv(half* out, const half* in, int n_kv, int repeats, int S, int D) {
     [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:tg_size];
 }
 
+void swiglu(half* out, const half* gate, const half* up, int n) {
+    DeviceContext& ctx = get_default_device_context();
+    id<MTLComputeCommandEncoder> enc = ctx.impl_->get_compute_encoder();
+    [enc setComputePipelineState:ctx.impl_->pso_swiglu];
+
+    bind_buffer_to_encoder(enc, out, 0);
+    bind_buffer_to_encoder(enc, gate, 1);
+    bind_buffer_to_encoder(enc, up, 2);
+    [enc setBytes:&n length:sizeof(int) atIndex:3];
+
+    MTLSize grid_size = MTLSizeMake((n + 255) / 256, 1, 1);
+    MTLSize tg_size = MTLSizeMake(256, 1, 1);
+    [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:tg_size];
+}
+
+void fused_causal_softmax(half* scores, int n_heads, int seq_len) {
+    DeviceContext& ctx = get_default_device_context();
+    id<MTLComputeCommandEncoder> enc = ctx.impl_->get_compute_encoder();
+    [enc setComputePipelineState:ctx.impl_->pso_fused_causal_softmax];
+
+    bind_buffer_to_encoder(enc, scores, 0);
+    [enc setBytes:&seq_len length:sizeof(int) atIndex:1];
+
+    int total_rows = n_heads * seq_len;
+    int t = std::min(256, seq_len);
+    if (t < 32) t = 32;
+    MTLSize grid_size = MTLSizeMake(total_rows, 1, 1);
+    MTLSize tg_size = MTLSizeMake(t, 1, 1);
+    [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:tg_size];
+}
+
+void transpose_and_repeat_kv(half* out, const half* in, int n_kv, int repeats, int S, int D) {
+    DeviceContext& ctx = get_default_device_context();
+    id<MTLComputeCommandEncoder> enc = ctx.impl_->get_compute_encoder();
+    [enc setComputePipelineState:ctx.impl_->pso_transpose_and_repeat_kv];
+
+    bind_buffer_to_encoder(enc, out, 0);
+    bind_buffer_to_encoder(enc, in, 1);
+    struct { int nkv, rep, S, D; } params = {n_kv, repeats, S, D};
+    [enc setBytes:&params length:sizeof(params) atIndex:2];
+
+    int total = n_kv * repeats * S * D;
+    MTLSize grid_size = MTLSizeMake((total + 255) / 256, 1, 1);
+    MTLSize tg_size = MTLSizeMake(256, 1, 1);
+    [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:tg_size];
+}
+
 // ===================== MPS Matrix Multiplication =====================
 
 void gemm_linear(DeviceContext& ctx, half* out, const half* in, const half* weight,
@@ -633,6 +773,30 @@ void gemm_batched(DeviceContext& ctx,
     size_t stride_b = rowsB * colsB * sizeof(half);
     size_t stride_c = M * N * sizeof(half);
 
+    // Native batched descriptors: single MPSMatrix descriptor for the entire batch
+    MPSMatrixDescriptor* desc_a = [MPSMatrixDescriptor matrixDescriptorWithRows:rowsA
+                                                                        columns:colsA
+                                                                       matrices:batch
+                                                                       rowBytes:colsA * sizeof(half)
+                                                                    matrixBytes:stride_a
+                                                                       dataType:MPSDataTypeFloat16];
+    MPSMatrixDescriptor* desc_b = [MPSMatrixDescriptor matrixDescriptorWithRows:rowsB
+                                                                        columns:colsB
+                                                                       matrices:batch
+                                                                       rowBytes:colsB * sizeof(half)
+                                                                    matrixBytes:stride_b
+                                                                       dataType:MPSDataTypeFloat16];
+    MPSMatrixDescriptor* desc_c = [MPSMatrixDescriptor matrixDescriptorWithRows:M
+                                                                        columns:N
+                                                                       matrices:batch
+                                                                       rowBytes:N * sizeof(half)
+                                                                    matrixBytes:stride_c
+                                                                       dataType:MPSDataTypeFloat16];
+
+    MPSMatrix* mat_a = [[MPSMatrix alloc] initWithBuffer:buf_a offset:base_a descriptor:desc_a];
+    MPSMatrix* mat_b = [[MPSMatrix alloc] initWithBuffer:buf_b offset:base_b descriptor:desc_b];
+    MPSMatrix* mat_c = [[MPSMatrix alloc] initWithBuffer:buf_c offset:base_c descriptor:desc_c];
+
     MPSMatrixMultiplication* matmul = [[MPSMatrixMultiplication alloc]
         initWithDevice:ctx.impl_->device
         transposeLeft:trans_a ? YES : NO
@@ -642,33 +806,10 @@ void gemm_batched(DeviceContext& ctx,
         interiorColumns:K
         alpha:alpha
         beta:0.0];
+    matmul.batchStart = 0;
+    matmul.batchSize = batch;
 
-    MPSMatrixDescriptor* desc_a = [MPSMatrixDescriptor matrixDescriptorWithRows:rowsA
-                                                                        columns:colsA
-                                                                       rowBytes:colsA * sizeof(half)
-                                                                       dataType:MPSDataTypeFloat16];
-    MPSMatrixDescriptor* desc_b = [MPSMatrixDescriptor matrixDescriptorWithRows:rowsB
-                                                                        columns:colsB
-                                                                       rowBytes:colsB * sizeof(half)
-                                                                       dataType:MPSDataTypeFloat16];
-    MPSMatrixDescriptor* desc_c = [MPSMatrixDescriptor matrixDescriptorWithRows:M
-                                                                        columns:N
-                                                                       rowBytes:N * sizeof(half)
-                                                                       dataType:MPSDataTypeFloat16];
-
-    for (int b = 0; b < batch; ++b) {
-        MPSMatrix* mat_a = [[MPSMatrix alloc] initWithBuffer:buf_a
-                                                      offset:base_a + b * stride_a
-                                                  descriptor:desc_a];
-        MPSMatrix* mat_b = [[MPSMatrix alloc] initWithBuffer:buf_b
-                                                      offset:base_b + b * stride_b
-                                                  descriptor:desc_b];
-        MPSMatrix* mat_c = [[MPSMatrix alloc] initWithBuffer:buf_c
-                                                      offset:base_c + b * stride_c
-                                                  descriptor:desc_c];
-
-        [matmul encodeToCommandBuffer:cb leftMatrix:mat_a rightMatrix:mat_b resultMatrix:mat_c];
-    }
+    [matmul encodeToCommandBuffer:cb leftMatrix:mat_a rightMatrix:mat_b resultMatrix:mat_c];
 }
 
 #endif

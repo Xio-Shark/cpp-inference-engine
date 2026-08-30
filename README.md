@@ -108,16 +108,25 @@ cpp-inference-engine/
 └── README.md
 ```
 
-## 技术要点
+## 技术要点与深度优化
 
-| 组件 | macOS (Apple Silicon) | Linux (NVIDIA) |
-|------|----------------------|----------------|
-| **内存管理** | `MTLResourceStorageModeShared` 统一内存零拷贝 | RAII `cudaMalloc` / `cudaFree` |
-| **权重加载** | `mmap()` 零拷贝直接注入 Metal 统一内存 | `mmap()` + `cudaMemcpy` H2D |
-| **矩阵运算** | `MPSMatrixMultiplication` (FP16) | `cublasHgemm` + Strided Batched |
-| **注意力机制** | GQA (`repeat_kv_kernel` MSL) + causal mask | GQA (`repeat_k` CUDA) + causal mask |
-| **激活函数** | Metal Compute Shader `silu_kernel` ⊙ up | CUDA `silu_k` ⊙ up |
+| 组件 / 算子 | 原版基础实现 | 深度性能优化方案 (当前状态) |
+|-------------|--------------|------------------------------|
+| **显存生命周期** | 每轮推理动态 `newBuffer`/`cudaMalloc` 17 次 | **全前向 0 次动态分配**：预分配连续 Scratchpad 工作区，各阶段复用偏移，彻底消除驱动锁与分配开销 |
+| **多头注意力 (GEMM)** | CPU 循环分发 28 次单头 GEMM + 84 个 `MPSMatrix` | **原生 Batched GEMM**：使用 `[MPSMatrixDescriptor matrixDescriptorWithRows:... columns:... matrices:... rowBytes:... matrixBytes:... dataType:...]` 与 `matmul.batchSize = batch`，单次分发 |
+| **GQA KV 处理** | 转置 `transpose_012_to_102` + 广播 `repeat_kv`（2 次显存往返） | **Fused Transpose & Repeat**：直接由 `[S, n_kv, D]` 计算出 `[n_heads, S, D]`，消除中间张量与显存搬运 |
+| **注意力归一化** | 写入 mask (-1e4) + 读回计算 Softmax（2 次全局显存往返） | **Fused Causal Softmax**：单个 GPU 线程组原地结合因果条件与两遍规约，消除掩码大矩阵显存分配与冗余访存 |
+| **MLP 激活函数** | `silu_inplace` (读/写) + `ewise_mul` (读2/写1)（共 5 次读写） | **Fused SwiGLU**：单个 GPU 内核完成 `silu(gate) * up` 计算，访存降至 2 读 1 写（访存带宽节约 40%） |
+| **内存管理** | `MTLResourceStorageModeShared` 统一内存零拷贝 | RAII `cudaMalloc` / `cudaFree` (CUDA) |
+| **权重加载** | `mmap()` 零拷贝直接注入 Metal 统一内存 | `mmap()` + `cudaMemcpy` H2D (CUDA) |
 | **位置编码** | Metal Compute Shader `rope_kernel` | CUDA `rope_k` |
+
+## 优化效果分析
+
+1. **CPU/GPU 调度瓶颈破除**：通过 MPS 原生 Batched GEMM，避免了每一层 28 个注意力头的 CPU 循环分发与 Objective-C 对象开辟，使 GPU 队列持续饱满。
+2. **全流程 0 显存分配 (Zero-Allocation)**：`TransformerLayer::forward` 在预热阶段预分配满足最大序列长度的共享工作区，循环推理过程中的显存分配次数从 17 次彻底降低为 **0 次**，完全消除多线程锁竞争与显存抖动。
+3. **全局访存流量断崖式下降**：融合 SwiGLU、因果 Softmax 与 Transpose-Repeat KV 后，每层推理减少了 4 个中间全量张量的落地存储，计算强度显著提高。
+
 | **层归一化** | Metal threadgroup shared memory 规约 RMSNorm | CUDA shared-memory 并行规约 RMSNorm |
 
 ## 性能验证

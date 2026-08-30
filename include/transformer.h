@@ -37,10 +37,13 @@ public:
 private:
     void linear(half* out, const half* in, const half* weight,
                 int M, int N, int K);
-    GpuTensor attention(const GpuTensor& x, int seq_len, int offset);
-    GpuTensor mlp(const GpuTensor& x, int seq_len);
+    void attention_out(half* out, const half* x_normed, int seq_len, int offset);
+    void mlp_out(half* out, const half* x_normed, int seq_len);
+    void ensure_workspace(int seq_len);
 
     TransformerConfig cfg_;
     DeviceContext& ctx_;
     LayerWeights w_;
+    GpuTensor workspace_;
+    int workspace_seq_len_ = 0;
 };

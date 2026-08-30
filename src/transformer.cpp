@@ -35,9 +35,73 @@ void TransformerLayer::linear(half* out, const half* in,
     gemm_linear(ctx_, out, in, W, M, N, K);
 }
 
+// ---- Workspace allocation ----
+void TransformerLayer::ensure_workspace(int S) {
+    if (workspace_seq_len_ >= S && workspace_.data() != nullptr) {
+        return;
+    }
+
+    int H = cfg_.hidden_size;
+    int nh = cfg_.num_heads;
+    int nkv = cfg_.num_kv_heads;
+    int D = cfg_.head_dim;
+    int I = cfg_.intermediate_size;
+    int qd = nh * D;
+    int kvd = nkv * D;
+
+    // Attention buffer sizes (in half elements):
+    // Q: [S, qd]
+    // K: [S, kvd]
+    // V: [S, kvd]
+    // Qt: [nh, S, D] == S * qd
+    // Kt: [nh, S, D] == S * qd
+    // Vt: [nh, S, D] == S * qd
+    // scores: [nh, S, S]
+    // attn: [nh, S, D] == S * qd
+    // attn_cat: [S, qd] == S * qd
+    // attn_out: [S, H]
+    //
+    // MLP buffer sizes:
+    // gate: [S, I]
+    // up: [S, I]
+    // mlp_out: [S, H]
+    //
+    // Forward layer-level:
+    // normed: [S, H]
+    // res1: [S, H]
+    //
+    // Peak memory needed simultaneously during Attention:
+    // Q (S*qd), K (S*kvd), V (S*kvd),
+    // Qt (S*qd), Kt (S*qd), Vt (S*qd),
+    // scores (nh*S*S), attn (S*qd), attn_cat (S*qd), attn_out (S*H),
+    // normed (S*H), res1 (S*H)
+    //
+    // Peak memory needed during MLP:
+    // gate (S*I), up (S*I), mlp_out (S*H), res1 (S*H)
+
+    size_t attn_needed = static_cast<size_t>(S) * (
+        qd + kvd + kvd +     // Q, K, V
+        qd + qd + qd +       // Qt, Kt, Vt
+        nh * S +             // scores
+        qd + qd +            // attn, attn_cat
+        H + H + H            // attn_out, normed, res1
+    );
+
+    size_t mlp_needed = static_cast<size_t>(S) * (
+        I + I + H + H        // gate, up, mlp_out, res1
+    );
+
+    size_t total_elements = std::max(attn_needed, mlp_needed);
+    // Align to 256 elements
+    total_elements = ((total_elements + 255) / 256) * 256;
+
+    workspace_ = GpuTensor({static_cast<int>(total_elements)});
+    workspace_seq_len_ = S;
+}
+
 // ---- GQA Self-Attention ----
-GpuTensor TransformerLayer::attention(const GpuTensor& x,
-                                       int S, int off) {
+void TransformerLayer::attention_out(half* out, const half* x_normed,
+                                     int S, int off) {
     int H = cfg_.hidden_size;
     int nh = cfg_.num_heads;
     int nkv = cfg_.num_kv_heads;
@@ -45,72 +109,74 @@ GpuTensor TransformerLayer::attention(const GpuTensor& x,
     int qd = nh * D, kvd = nkv * D;
     int rep = nh / nkv;
 
+    half* ws = workspace_.data();
+    size_t cur = 0;
+
+    half* ptr_Q        = ws + cur; cur += static_cast<size_t>(S) * qd;
+    half* ptr_K        = ws + cur; cur += static_cast<size_t>(S) * kvd;
+    half* ptr_V        = ws + cur; cur += static_cast<size_t>(S) * kvd;
+    half* ptr_Qt       = ws + cur; cur += static_cast<size_t>(S) * qd;
+    half* ptr_Kt       = ws + cur; cur += static_cast<size_t>(S) * qd;
+    half* ptr_Vt       = ws + cur; cur += static_cast<size_t>(S) * qd;
+    half* ptr_scores   = ws + cur; cur += static_cast<size_t>(nh) * S * S;
+    half* ptr_attn     = ws + cur; cur += static_cast<size_t>(S) * qd;
+    half* ptr_attn_cat = ws + cur; cur += static_cast<size_t>(S) * qd;
+
     // 1. Q/K/V projections
-    GpuTensor Q({S, qd}), K({S, kvd}), V({S, kvd});
-    linear(Q.data(), x.data(), w_.q_proj.data(), S, qd, H);
-    linear(K.data(), x.data(), w_.k_proj.data(), S, kvd, H);
-    linear(V.data(), x.data(), w_.v_proj.data(), S, kvd, H);
+    linear(ptr_Q, x_normed, w_.q_proj.data(), S, qd, H);
+    linear(ptr_K, x_normed, w_.k_proj.data(), S, kvd, H);
+    linear(ptr_V, x_normed, w_.v_proj.data(), S, kvd, H);
 
     // 2. RoPE on Q [S, nh, D] and K [S, nkv, D]
-    apply_rope(Q.data(), K.data(), S, nh, nkv, D, off, cfg_.rope_theta);
+    apply_rope(ptr_Q, ptr_K, S, nh, nkv, D, off, cfg_.rope_theta);
 
-    // 3. Transpose to [heads, S, D]
-    GpuTensor Qt({nh, S, D}), Kt0({nkv, S, D}), Vt0({nkv, S, D});
-    transpose_012_to_102(Qt.data(), Q.data(), S, nh, D);
-    transpose_012_to_102(Kt0.data(), K.data(), S, nkv, D);
-    transpose_012_to_102(Vt0.data(), V.data(), S, nkv, D);
+    // 3. Transpose Q: [S, nh, D] -> [nh, S, D]
+    transpose_012_to_102(ptr_Qt, ptr_Q, S, nh, D);
 
-    // 4. GQA: repeat K/V → [nh, S, D]
-    GpuTensor Kt({nh, S, D}), Vt({nh, S, D});
-    repeat_kv(Kt.data(), Kt0.data(), nkv, rep, S, D);
-    repeat_kv(Vt.data(), Vt0.data(), nkv, rep, S, D);
+    // 4. Fused Transpose & Repeat KV: [S, nkv, D] -> [nh, S, D]
+    // Eliminates separate transpose_012_to_102 and repeat_kv intermediate buffers!
+    transpose_and_repeat_kv(ptr_Kt, ptr_K, nkv, rep, S, D);
+    transpose_and_repeat_kv(ptr_Vt, ptr_V, nkv, rep, S, D);
 
     // 5. Attention scores: [nh, S, S] = Qt @ Kt^T / sqrt(D)
-    GpuTensor scores({nh, S, S});
     float alpha = 1.0f / std::sqrt(static_cast<float>(D));
-    // For each head h: scores[h] = Qt[h] [S, D] @ Kt[h]^T [D, S] -> [S, S]
     gemm_batched(ctx_,
-                 scores.data(), Qt.data(), Kt.data(),
+                 ptr_scores, ptr_Qt, ptr_Kt,
                  nh, S, S, D,
                  false, true, alpha);
 
-    // 6. Causal mask + softmax
-    causal_mask(scores.data(), nh, S);
-    softmax_rows(scores.data(), nh * S, S);
+    // 6. Fused causal mask + softmax in a single pass (eliminates writing intermediate masked scores)
+    fused_causal_softmax(ptr_scores, nh, S);
 
     // 7. Attention output: [nh, S, D] = scores @ Vt
-    // scores[h] [S, S] @ Vt[h] [S, D] -> [S, D]
-    GpuTensor attn({nh, S, D});
     gemm_batched(ctx_,
-                 attn.data(), scores.data(), Vt.data(),
+                 ptr_attn, ptr_scores, ptr_Vt,
                  nh, S, D, S,
                  false, false, 1.0f);
 
     // 8. Transpose back: [nh, S, D] → [S, nh, D] = [S, qd]
-    GpuTensor attn_cat({S, qd});
-    transpose_012_to_102(attn_cat.data(), attn.data(), nh, S, D);
+    transpose_012_to_102(ptr_attn_cat, ptr_attn, nh, S, D);
 
-    // 9. Output projection
-    GpuTensor out({S, H});
-    linear(out.data(), attn_cat.data(), w_.o_proj.data(), S, H, qd);
-    return out;
+    // 9. Output projection: [S, H]
+    linear(out, ptr_attn_cat, w_.o_proj.data(), S, H, qd);
 }
 
 // ---- SwiGLU MLP ----
-GpuTensor TransformerLayer::mlp(const GpuTensor& x, int S) {
+void TransformerLayer::mlp_out(half* out, const half* x_normed, int S) {
     int H = cfg_.hidden_size;
     int I = cfg_.intermediate_size;
 
-    GpuTensor gate({S, I}), up({S, I});
-    linear(gate.data(), x.data(), w_.gate_proj.data(), S, I, H);
-    linear(up.data(), x.data(), w_.up_proj.data(), S, I, H);
+    half* ws = workspace_.data();
+    half* ptr_gate = ws;
+    half* ptr_up   = ws + static_cast<size_t>(S) * I;
 
-    silu_inplace(gate.data(), S * I);
-    ewise_mul(gate.data(), gate.data(), up.data(), S * I);
+    linear(ptr_gate, x_normed, w_.gate_proj.data(), S, I, H);
+    linear(ptr_up, x_normed, w_.up_proj.data(), S, I, H);
 
-    GpuTensor out({S, H});
-    linear(out.data(), gate.data(), w_.down_proj.data(), S, H, I);
-    return out;
+    // Fused SwiGLU activation: gate = silu(gate) * up in a single memory pass
+    swiglu(ptr_gate, ptr_gate, ptr_up, S * I);
+
+    linear(out, ptr_gate, w_.down_proj.data(), S, H, I);
 }
 
 // ---- Full layer forward ----
@@ -119,24 +185,46 @@ GpuTensor TransformerLayer::forward(const GpuTensor& input,
     int H = cfg_.hidden_size;
     int n = S * H;
 
-    // Pre-norm → attention → residual
-    GpuTensor normed({S, H});
-    rms_norm(normed.data(), input.data(), w_.input_norm.data(),
+    ensure_workspace(S);
+
+    // Workspace offsets for persistent buffers during this forward step
+    // Attention buffers end before the persistent tail of workspace
+    int nh = cfg_.num_heads;
+    int D = cfg_.head_dim;
+    int qd = nh * D;
+    int kvd = cfg_.num_kv_heads * D;
+
+    size_t attn_scratch_size = static_cast<size_t>(S) * (
+        qd + kvd + kvd +     // Q, K, V
+        qd + qd + qd +       // Qt, Kt, Vt
+        nh * S +             // scores
+        qd + qd              // attn, attn_cat
+    );
+
+    half* ws_base = workspace_.data();
+    half* ptr_normed   = ws_base + attn_scratch_size;
+    half* ptr_attn_out = ptr_normed + static_cast<size_t>(n);
+    half* ptr_res1     = ptr_attn_out + static_cast<size_t>(n);
+
+    // 1. Pre-norm
+    rms_norm(ptr_normed, input.data(), w_.input_norm.data(),
              S, H, cfg_.rms_norm_eps);
 
-    GpuTensor attn_out = attention(normed, S, off);
+    // 2. Attention
+    attention_out(ptr_attn_out, ptr_normed, S, off);
 
-    GpuTensor res1({S, H});
-    ewise_add(res1.data(), input.data(), attn_out.data(), n);
+    // 3. Residual 1: res1 = input + attn_out
+    ewise_add(ptr_res1, input.data(), ptr_attn_out, n);
 
-    // Post-norm → MLP → residual
-    GpuTensor normed2({S, H});
-    rms_norm(normed2.data(), res1.data(), w_.post_norm.data(),
+    // 4. Post-norm: normed2 -> ptr_normed (reuse ptr_normed buffer)
+    rms_norm(ptr_normed, ptr_res1, w_.post_norm.data(),
              S, H, cfg_.rms_norm_eps);
 
-    GpuTensor mlp_out = mlp(normed2, S);
+    // 5. MLP: mlp_out -> ptr_attn_out (reuse ptr_attn_out buffer)
+    mlp_out(ptr_attn_out, ptr_normed, S);
 
+    // 6. Residual 2: output = res1 + mlp_out
     GpuTensor output({S, H});
-    ewise_add(output.data(), res1.data(), mlp_out.data(), n);
+    ewise_add(output.data(), ptr_res1, ptr_attn_out, n);
     return output;
 }

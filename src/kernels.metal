@@ -234,3 +234,99 @@ kernel void repeat_kv_kernel(
 
     out[idx] = in[(h / p.rep) * p.S * p.D + s * p.D + d];
 }
+
+// ===================== SwiGLU Fused Kernel =====================
+kernel void swiglu_kernel(
+    device half* out                  [[buffer(0)]],
+    device const half* gate           [[buffer(1)]],
+    device const half* up             [[buffer(2)]],
+    constant int& n                   [[buffer(3)]],
+    uint idx                          [[thread_position_in_grid]]
+) {
+    if (idx < uint(n)) {
+        float g = float(gate[idx]);
+        float u = float(up[idx]);
+        float silu_g = g / (1.0f + exp(-g));
+        out[idx] = half(silu_g * u);
+    }
+}
+
+// ===================== Fused Causal Softmax =====================
+// Each threadgroup processes one row (one query position of one head)
+// Row length is S (columns). Causal condition: c > r is masked to -inf.
+kernel void fused_causal_softmax_kernel(
+    device half* scores               [[buffer(0)]],
+    constant int& S                   [[buffer(1)]],
+    uint row_idx                      [[threadgroup_position_in_grid]],
+    uint tid                          [[thread_position_in_threadgroup]],
+    uint threads_per_group            [[threads_per_threadgroup]]
+) {
+    int r = row_idx % S; // position in sequence
+    device half* row_ptr = scores + row_idx * S;
+    threadgroup float sm[256];
+
+    // 1. Find max for valid positions c <= r
+    float mx = -1e30f;
+    for (int c = tid; c <= r; c += threads_per_group) {
+        mx = max(mx, float(row_ptr[c]));
+    }
+    sm[tid] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = threads_per_group >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            sm[tid] = max(sm[tid], sm[tid + s]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mv = sm[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2. Compute sum of exp(val - mv) for c <= r
+    float es = 0.0f;
+    for (int c = tid; c <= r; c += threads_per_group) {
+        es += exp(float(row_ptr[c]) - mv);
+    }
+    sm[tid] = es;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = threads_per_group >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            sm[tid] += sm[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = (sm[0] > 0.0f) ? (1.0f / sm[0]) : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3. Write normalized probabilities for c <= r, and 0 for c > r
+    for (int c = tid; c < S; c += threads_per_group) {
+        if (c <= r) {
+            row_ptr[c] = half(exp(float(row_ptr[c]) - mv) * inv_sum);
+        } else {
+            row_ptr[c] = half(0.0f);
+        }
+    }
+}
+
+// ===================== Fused Transpose & Repeat KV =====================
+// Input:  [S, n_kv, D]
+// Output: [n_heads, S, D] where n_heads = n_kv * repeats
+kernel void transpose_and_repeat_kv_kernel(
+    device half* out                  [[buffer(0)]],
+    device const half* in             [[buffer(1)]],
+    constant RepeatKVParams& p        [[buffer(2)]],
+    uint idx                          [[thread_position_in_grid]]
+) {
+    int total = p.nkv * p.rep * p.S * p.D;
+    if (idx >= uint(total)) return;
+
+    int d = idx % p.D;
+    int s = (idx / p.D) % p.S;
+    int h = idx / (p.S * p.D);
+    int kv_h = h / p.rep;
+
+    // in is [S, nkv, D]
+    out[idx] = in[s * (p.nkv * p.D) + kv_h * p.D + d];
+}
+

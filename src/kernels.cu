@@ -167,6 +167,8 @@ void transpose_012_to_102(half* o, const half* in, int A, int B, int D) {
     int n = A * B * D;
     transpose_k<<<(n + BLK - 1) / BLK, BLK>>>(o, in, A, B, D);
     CUDA_CHECK(cudaGetLastError());
+}
+
 __global__ void repeat_k(half* o, const half* in, int nkv, int rep, int S, int D) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = nkv * rep * S * D;
@@ -178,6 +180,94 @@ __global__ void repeat_k(half* o, const half* in, int nkv, int rep, int S, int D
 void repeat_kv(half* o, const half* in, int nkv, int rep, int S, int D) {
     int n = nkv * rep * S * D;
     repeat_k<<<(n + BLK - 1) / BLK, BLK>>>(o, in, nkv, rep, S, D);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ===================== SwiGLU Fused Kernel =====================
+__global__ void swiglu_k(half* o, const half* gate, const half* up, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = __half2float(gate[i]);
+        float u = __half2float(up[i]);
+        float silu_g = g / (1.0f + expf(-g));
+        o[i] = __float2half(silu_g * u);
+    }
+}
+
+void swiglu(half* out, const half* gate, const half* up, int n) {
+    swiglu_k<<<(n + BLK - 1) / BLK, BLK>>>(out, gate, up, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ===================== Fused Causal Softmax =====================
+// Each thread block processes one row (one query position of one head)
+__global__ void fused_causal_softmax_k(half* scores, int S) {
+    int row_idx = blockIdx.x;
+    int r = row_idx % S;
+    half* row_ptr = scores + row_idx * S;
+    extern __shared__ float sm[];
+
+    float mx = -1e30f;
+    for (int c = threadIdx.x; c <= r; c += blockDim.x) {
+        mx = fmaxf(mx, __half2float(row_ptr[c]));
+    }
+    sm[threadIdx.x] = mx;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sm[threadIdx.x] = fmaxf(sm[threadIdx.x], sm[threadIdx.x + s]);
+        __syncthreads();
+    }
+    float mv = sm[0];
+    __syncthreads();
+
+    float es = 0.0f;
+    for (int c = threadIdx.x; c <= r; c += blockDim.x) {
+        es += expf(__half2float(row_ptr[c]) - mv);
+    }
+    sm[threadIdx.x] = es;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sm[threadIdx.x] += sm[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv_sum = (sm[0] > 0.0f) ? (1.0f / sm[0]) : 0.0f;
+
+    for (int c = threadIdx.x; c < S; c += blockDim.x) {
+        if (c <= r) {
+            row_ptr[c] = __float2half(expf(__half2float(row_ptr[c]) - mv) * inv_sum);
+        } else {
+            row_ptr[c] = __float2half(0.0f);
+        }
+    }
+}
+
+void fused_causal_softmax(half* scores, int n_heads, int seq_len) {
+    int total_rows = n_heads * seq_len;
+    int t = min(BLK, seq_len);
+    if (t < 32) t = 32;
+    fused_causal_softmax_k<<<total_rows, t, t * sizeof(float)>>>(scores, seq_len);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ===================== Fused Transpose & Repeat KV =====================
+__global__ void transpose_and_repeat_kv_k(half* o, const half* in, int nkv, int rep, int S, int D) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = nkv * rep * S * D;
+    if (idx >= total) return;
+
+    int d = idx % D;
+    int s = (idx / D) % S;
+    int h = idx / (S * D);
+    int kv_h = h / rep;
+
+    o[idx] = in[s * (nkv * D) + kv_h * D + d];
+}
+
+void transpose_and_repeat_kv(half* out, const half* in, int n_kv, int repeats, int S, int D) {
+    int total = n_kv * repeats * S * D;
+    transpose_and_repeat_kv_k<<<(total + BLK - 1) / BLK, BLK>>>(out, in, n_kv, repeats, S, D);
     CUDA_CHECK(cudaGetLastError());
 }
 
