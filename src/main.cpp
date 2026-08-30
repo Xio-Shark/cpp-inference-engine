@@ -1,7 +1,8 @@
 // main.cpp — Minimal C++ LLM inference engine demo
 // Loads one transformer layer from Qwen2.5-7B safetensors and runs forward pass.
-#include "transformer.cuh"
+#include "transformer.h"
 #include "safetensors.h"
+#include "device_utils.h"
 #include <cstdio>
 #include <string>
 #include <chrono>
@@ -90,14 +91,19 @@ int main(int argc, char** argv) {
     // Load config
     auto cfg = TransformerConfig::from_json(args.model_dir + "/config.json");
     printf("=== Tiny C++ Inference Engine ===\n");
+#if defined(__APPLE__)
+    printf("Backend: Apple Metal & MPS (Apple Silicon)\n");
+#else
+    printf("Backend: NVIDIA CUDA & cuBLAS\n");
+#endif
     printf("Model: Qwen2.5-7B-Instruct (FP16)\n");
     printf("Config: hidden=%d, heads=%d, kv_heads=%d, head_dim=%d\n",
            cfg.hidden_size, cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
     printf("Layer: %d, Seq length: %d\n\n", args.layer_idx, args.seq_len);
 
-    // Setup
-    CublasHandle cublas;
-    TransformerLayer layer(cfg, cublas);
+    // Setup device context
+    DeviceContext ctx;
+    TransformerLayer layer(cfg, ctx);
     load_layer(layer, args, cfg);
 
     // Create random input [seq_len, hidden_size]
@@ -112,14 +118,16 @@ int main(int argc, char** argv) {
     // Warmup
     printf("Running warmup...\n");
     auto out = layer.forward(input, S);
+    ctx.synchronize();
 
     // Benchmark
     constexpr int ITERS = 10;
-    CUDA_CHECK(cudaDeviceSynchronize());
+    ctx.synchronize();
     auto t0 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < ITERS; ++i)
+    for (int i = 0; i < ITERS; ++i) {
         out = layer.forward(input, S);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    ctx.synchronize();
     auto t1 = std::chrono::high_resolution_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 

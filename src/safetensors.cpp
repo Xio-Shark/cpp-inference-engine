@@ -84,12 +84,10 @@ GpuTensor SafetensorsFile::load_tensor(const std::string& name) const {
             else                h = sign | (exp << 10) | mant;
             fp16_buf[i] = h;
         }
-        CUDA_CHECK(cudaMemcpy(t.data(), fp16_buf.data(),
-                              numel * sizeof(uint16_t), cudaMemcpyHostToDevice));
+        t.load_from_host(reinterpret_cast<const half*>(fp16_buf.data()), numel);
     } else {
-        // F16 or F32: direct copy (F16 assumed)
-        CUDA_CHECK(cudaMemcpy(t.data(), src, m.nbytes,
-                              cudaMemcpyHostToDevice));
+        // F16 direct load
+        t.load_from_host(reinterpret_cast<const half*>(src), numel);
     }
     return t;
 }

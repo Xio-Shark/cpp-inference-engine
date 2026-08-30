@@ -1,7 +1,8 @@
+#if defined(USE_CUDA) || defined(__CUDACC__)
 // kernels.cu — Custom CUDA kernels for transformer inference
 // RMSNorm, RoPE, SiLU, element-wise ops, softmax, layout transforms
-#include "kernels.cuh"
-#include "cuda_utils.cuh"
+#include "kernels.h"
+#include "device_utils.h"
 #include <cfloat>
 
 static constexpr int BLK = 256;
@@ -166,8 +167,6 @@ void transpose_012_to_102(half* o, const half* in, int A, int B, int D) {
     int n = A * B * D;
     transpose_k<<<(n + BLK - 1) / BLK, BLK>>>(o, in, A, B, D);
     CUDA_CHECK(cudaGetLastError());
-}
-
 __global__ void repeat_k(half* o, const half* in, int nkv, int rep, int S, int D) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = nkv * rep * S * D;
@@ -181,3 +180,43 @@ void repeat_kv(half* o, const half* in, int nkv, int rep, int S, int D) {
     repeat_k<<<(n + BLK - 1) / BLK, BLK>>>(o, in, nkv, rep, S, D);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ===================== cuBLAS GEMM Implementations =====================
+#if defined(USE_CUDA) || defined(__CUDACC__)
+void gemm_linear(DeviceContext& ctx, half* out, const half* in, const half* weight,
+                 int M, int N, int K) {
+    cublasHandle_t handle = static_cast<cublasHandle_t>(ctx.get_native_handle());
+    half alpha = __float2half(1.0f);
+    half beta  = __float2half(0.0f);
+    CUBLAS_CHECK(cublasHgemm(handle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        N, M, K, &alpha, weight, K, in, K, &beta, out, N));
+}
+
+void gemm_batched(DeviceContext& ctx,
+                  half* C, const half* A, const half* B,
+                  int batch, int M, int N, int K,
+                  bool trans_a, bool trans_b, float alpha_val) {
+    cublasHandle_t handle = static_cast<cublasHandle_t>(ctx.get_native_handle());
+    half alpha = __float2half(alpha_val);
+    half beta  = __float2half(0.0f);
+    cublasOperation_t opA = trans_a ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t opB = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+    int lda = trans_a ? M : K;
+    int ldb = trans_b ? K : N;
+    int strideA = M * K;
+    int strideB = K * N;
+    int strideC = M * N;
+
+    CUBLAS_CHECK(cublasHgemmStridedBatched(handle,
+        opB, opA,
+        N, M, K,
+        &alpha,
+        B, ldb, strideB,
+        A, lda, strideA,
+        &beta,
+        C, N, strideC,
+        batch));
+}
+#endif // USE_CUDA
+#endif // file level USE_CUDA

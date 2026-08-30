@@ -1,5 +1,5 @@
 #pragma once
-#include "tensor.cuh"
+#include "tensor.h"
 #include <string>
 #include <unordered_map>
 #include <vector>

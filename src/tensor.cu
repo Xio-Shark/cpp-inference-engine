@@ -1,4 +1,5 @@
-#include "tensor.cuh"
+#if defined(USE_CUDA) || defined(__CUDACC__)
+#include "tensor.h"
 
 GpuTensor::GpuTensor(std::vector<int> shape) : shape_(std::move(shape)) {
     CUDA_CHECK(cudaMalloc(&data_, numel() * sizeof(half)));
@@ -10,8 +11,9 @@ GpuTensor::~GpuTensor() {
 }
 
 GpuTensor::GpuTensor(GpuTensor&& o) noexcept
-    : data_(o.data_), shape_(std::move(o.shape_)), owned_(o.owned_) {
+    : data_(o.data_), shape_(std::move(o.shape_)), owned_(o.owned_), native_buffer_(o.native_buffer_) {
     o.data_ = nullptr;
+    o.native_buffer_ = nullptr;
     o.owned_ = false;
 }
 
@@ -21,7 +23,9 @@ GpuTensor& GpuTensor::operator=(GpuTensor&& o) noexcept {
         data_ = o.data_;
         shape_ = std::move(o.shape_);
         owned_ = o.owned_;
+        native_buffer_ = o.native_buffer_;
         o.data_ = nullptr;
+        o.native_buffer_ = nullptr;
         o.owned_ = false;
     }
     return *this;
@@ -43,3 +47,4 @@ void GpuTensor::copy_to_host(half* dst, size_t n) const {
     CUDA_CHECK(cudaMemcpy(dst, data_, n * sizeof(half),
                           cudaMemcpyDeviceToHost));
 }
+#endif
