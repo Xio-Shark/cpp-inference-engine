@@ -51,8 +51,7 @@ GpuTensor::~GpuTensor() {
     if (owned_ && native_buffer_) {
         unregister_metal_buffer(data_);
         @autoreleasepool {
-            id<MTLBuffer> buf = CFBridgingRelease(native_buffer_);
-            buf = nil;
+            (void)CFBridgingRelease(native_buffer_);
         }
         native_buffer_ = nullptr;
         data_ = nullptr;
@@ -71,8 +70,7 @@ GpuTensor& GpuTensor::operator=(GpuTensor&& o) noexcept {
         if (owned_ && native_buffer_) {
             unregister_metal_buffer(data_);
             @autoreleasepool {
-                id<MTLBuffer> buf = CFBridgingRelease(native_buffer_);
-                buf = nil;
+                (void)CFBridgingRelease(native_buffer_);
             }
         }
         data_ = o.data_;

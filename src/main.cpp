@@ -30,7 +30,7 @@ static Args parse_args(int argc, char** argv) {
 
 /// Load layer weights from sharded safetensors files.
 static void load_layer(TransformerLayer& layer, const Args& args,
-                        const TransformerConfig& cfg) {
+                        const TransformerConfig& /*cfg*/) {
     int idx = args.layer_idx;
     auto prefix = "model.layers." + std::to_string(idx) + ".";
 

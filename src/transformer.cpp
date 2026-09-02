@@ -49,49 +49,35 @@ void TransformerLayer::ensure_workspace(int S) {
     int qd = nh * D;
     int kvd = nkv * D;
 
-    // Attention buffer sizes (in half elements):
-    // Q: [S, qd]
-    // K: [S, kvd]
-    // V: [S, kvd]
-    // Qt: [nh, S, D] == S * qd
-    // Kt: [nh, S, D] == S * qd
-    // Vt: [nh, S, D] == S * qd
-    // scores: [nh, S, S]
-    // attn: [nh, S, D] == S * qd
-    // attn_cat: [S, qd] == S * qd
-    // attn_out: [S, H]
-    //
-    // MLP buffer sizes:
-    // gate: [S, I]
-    // up: [S, I]
-    // mlp_out: [S, H]
-    //
-    // Forward layer-level:
-    // normed: [S, H]
-    // res1: [S, H]
-    //
-    // Peak memory needed simultaneously during Attention:
-    // Q (S*qd), K (S*kvd), V (S*kvd),
-    // Qt (S*qd), Kt (S*qd), Vt (S*qd),
-    // scores (nh*S*S), attn (S*qd), attn_cat (S*qd), attn_out (S*H),
-    // normed (S*H), res1 (S*H)
-    //
-    // Peak memory needed during MLP:
-    // gate (S*I), up (S*I), mlp_out (S*H), res1 (S*H)
+    // Buffer layout in workspace:
+    // [0, S*H):               res1 (persists across Attention and MLP)
+    // [S*H, 2*S*H):           normed (pre-norm and post-norm buffer)
+    // [2*S*H, 2*S*H + scratch): Scratchpad (reused between Attention and MLP phases)
+    size_t persistent_needed = static_cast<size_t>(S) * H * 2;
 
+    // Attention scratchpad sizes:
+    // Q (S*qd), K (S*kvd), V (S*kvd)
+    // Qt (S*qd), Kt (S*qd), Vt (S*qd)
+    // scores (nh*S*S)
+    // attn (S*qd), attn_cat (S*qd)
+    // attn_out (S*H)
     size_t attn_needed = static_cast<size_t>(S) * (
         qd + kvd + kvd +     // Q, K, V
         qd + qd + qd +       // Qt, Kt, Vt
         nh * S +             // scores
         qd + qd +            // attn, attn_cat
-        H + H + H            // attn_out, normed, res1
+        H                    // attn_out
     );
 
+    // MLP scratchpad sizes:
+    // gate (S*I), up (S*I), mlp_out (S*H)
     size_t mlp_needed = static_cast<size_t>(S) * (
-        I + I + H + H        // gate, up, mlp_out, res1
+        I + I + H
     );
 
-    size_t total_elements = std::max(attn_needed, mlp_needed);
+    size_t max_scratch = std::max(attn_needed, mlp_needed);
+    size_t total_elements = persistent_needed + max_scratch;
+
     // Align to 256 elements
     total_elements = ((total_elements + 255) / 256) * 256;
 
@@ -109,7 +95,8 @@ void TransformerLayer::attention_out(half* out, const half* x_normed,
     int qd = nh * D, kvd = nkv * D;
     int rep = nh / nkv;
 
-    half* ws = workspace_.data();
+    half* ws_base = workspace_.data();
+    half* ws = ws_base + 2 * static_cast<size_t>(S) * H;
     size_t cur = 0;
 
     half* ptr_Q        = ws + cur; cur += static_cast<size_t>(S) * qd;
@@ -166,7 +153,8 @@ void TransformerLayer::mlp_out(half* out, const half* x_normed, int S) {
     int H = cfg_.hidden_size;
     int I = cfg_.intermediate_size;
 
-    half* ws = workspace_.data();
+    half* ws_base = workspace_.data();
+    half* ws = ws_base + 2 * static_cast<size_t>(S) * H;
     half* ptr_gate = ws;
     half* ptr_up   = ws + static_cast<size_t>(S) * I;
 
@@ -187,44 +175,33 @@ GpuTensor TransformerLayer::forward(const GpuTensor& input,
 
     ensure_workspace(S);
 
-    // Workspace offsets for persistent buffers during this forward step
-    // Attention buffers end before the persistent tail of workspace
-    int nh = cfg_.num_heads;
-    int D = cfg_.head_dim;
-    int qd = nh * D;
-    int kvd = cfg_.num_kv_heads * D;
-
-    size_t attn_scratch_size = static_cast<size_t>(S) * (
-        qd + kvd + kvd +     // Q, K, V
-        qd + qd + qd +       // Qt, Kt, Vt
-        nh * S +             // scores
-        qd + qd              // attn, attn_cat
-    );
-
     half* ws_base = workspace_.data();
-    half* ptr_normed   = ws_base + attn_scratch_size;
-    half* ptr_attn_out = ptr_normed + static_cast<size_t>(n);
-    half* ptr_res1     = ptr_attn_out + static_cast<size_t>(n);
+    half* ptr_res1    = ws_base;
+    half* ptr_normed  = ws_base + n;
+    half* ptr_scratch = ws_base + 2 * n;
 
-    // 1. Pre-norm
+    // 1. Pre-norm: normed = rms_norm(input)
     rms_norm(ptr_normed, input.data(), w_.input_norm.data(),
              S, H, cfg_.rms_norm_eps);
 
-    // 2. Attention
+    // 2. Attention: output goes into dedicated attn_out slot in scratchpad
+    half* ptr_attn_out = ptr_scratch;
     attention_out(ptr_attn_out, ptr_normed, S, off);
 
     // 3. Residual 1: res1 = input + attn_out
     ewise_add(ptr_res1, input.data(), ptr_attn_out, n);
 
-    // 4. Post-norm: normed2 -> ptr_normed (reuse ptr_normed buffer)
+    // 4. Post-norm: normed = rms_norm(res1)
     rms_norm(ptr_normed, ptr_res1, w_.post_norm.data(),
              S, H, cfg_.rms_norm_eps);
 
-    // 5. MLP: mlp_out -> ptr_attn_out (reuse ptr_attn_out buffer)
-    mlp_out(ptr_attn_out, ptr_normed, S);
+    // 5. MLP: gate & up in scratchpad, output goes into non-overlapping mlp_out slot
+    half* ptr_mlp_out = ptr_scratch + static_cast<size_t>(S) * (2 * cfg_.intermediate_size);
+    mlp_out(ptr_mlp_out, ptr_normed, S);
 
     // 6. Residual 2: output = res1 + mlp_out
     GpuTensor output({S, H});
-    ewise_add(output.data(), ptr_res1, ptr_attn_out, n);
+    ewise_add(output.data(), ptr_res1, ptr_mlp_out, n);
     return output;
 }
+

@@ -44,6 +44,7 @@ if(APPLE)
     )
 
     target_compile_definitions(tiny_inference_lib PUBLIC -D__APPLE__=1)
+    target_compile_options(tiny_inference_lib PUBLIC "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
 
 else()
     message(STATUS "Configuring for Linux/Windows with NVIDIA CUDA & cuBLAS")

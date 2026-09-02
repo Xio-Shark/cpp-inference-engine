@@ -271,6 +271,37 @@ void transpose_and_repeat_kv(half* out, const half* in, int n_kv, int repeats, i
     CUDA_CHECK(cudaGetLastError());
 }
 
+// ===================== DeviceContext CUDA Implementation =====================
+class DeviceContextImpl {
+public:
+    cublasHandle_t handle = nullptr;
+    cudaStream_t stream = nullptr;
+
+    DeviceContextImpl() {
+        CUBLAS_CHECK(cublasCreate(&handle));
+        CUDA_CHECK(cudaStreamCreate(&stream));
+        CUBLAS_CHECK(cublasSetStream(handle, stream));
+    }
+    ~DeviceContextImpl() {
+        if (handle) cublasDestroy(handle);
+        if (stream) cudaStreamDestroy(stream);
+    }
+    void synchronize() {
+        if (stream) CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+};
+
+DeviceContext::DeviceContext() : impl_(std::make_shared<DeviceContextImpl>()) {}
+DeviceContext::~DeviceContext() = default;
+
+void* DeviceContext::get_native_handle() const {
+    return impl_ ? static_cast<void*>(impl_->handle) : nullptr;
+}
+
+void DeviceContext::synchronize() {
+    if (impl_) impl_->synchronize();
+}
+
 // ===================== cuBLAS GEMM Implementations =====================
 #if defined(USE_CUDA) || defined(__CUDACC__)
 void gemm_linear(DeviceContext& ctx, half* out, const half* in, const half* weight,
@@ -310,3 +341,4 @@ void gemm_batched(DeviceContext& ctx,
 }
 #endif // USE_CUDA
 #endif // file level USE_CUDA
+

@@ -74,16 +74,16 @@ class DeviceContext {
 public:
     DeviceContext();
     ~DeviceContext();
-    DeviceContext(const DeviceContext&) = delete;
-    DeviceContext& operator=(const DeviceContext&) = delete;
-    DeviceContext(DeviceContext&&) noexcept;
-    DeviceContext& operator=(DeviceContext&&) noexcept;
+    DeviceContext(const DeviceContext&) = default;
+    DeviceContext& operator=(const DeviceContext&) = default;
+    DeviceContext(DeviceContext&&) noexcept = default;
+    DeviceContext& operator=(DeviceContext&&) noexcept = default;
 
     void* get_native_handle() const;
     void synchronize();
 
-private:
-    std::unique_ptr<DeviceContextImpl> impl_;
+    DeviceContextImpl* impl() const { return impl_.get(); }
+    std::shared_ptr<DeviceContextImpl> impl_;
 };
 
 // Compatibility alias for existing code referencing CublasHandle

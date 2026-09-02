@@ -475,10 +475,16 @@ public:
     }
 };
 
-DeviceContext::DeviceContext() : impl_(std::make_unique<DeviceContextImpl>()) {}
+static std::shared_ptr<DeviceContextImpl> g_shared_device_context_impl;
+static std::once_flag g_shared_device_context_flag;
+
+DeviceContext::DeviceContext() {
+    std::call_once(g_shared_device_context_flag, []() {
+        g_shared_device_context_impl = std::make_shared<DeviceContextImpl>();
+    });
+    impl_ = g_shared_device_context_impl;
+}
 DeviceContext::~DeviceContext() = default;
-DeviceContext::DeviceContext(DeviceContext&&) noexcept = default;
-DeviceContext& DeviceContext::operator=(DeviceContext&&) noexcept = default;
 
 void* DeviceContext::get_native_handle() const {
     return (__bridge void*)impl_->device;
@@ -520,7 +526,8 @@ void rms_norm(half* out, const half* x, const half* w,
     [enc setBytes:&hidden length:sizeof(int) atIndex:3];
     [enc setBytes:&eps length:sizeof(float) atIndex:4];
 
-    int t = std::min(256, hidden);
+    int t = 32;
+    while (t < hidden && t < 256) t <<= 1;
     MTLSize tg_size = MTLSizeMake(t, 1, 1);
     MTLSize grid_size = MTLSizeMake(rows, 1, 1);
     [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:tg_size];
@@ -599,7 +606,8 @@ void softmax_rows(half* data, int rows, int cols) {
     bind_buffer_to_encoder(enc, data, 0);
     [enc setBytes:&cols length:sizeof(int) atIndex:1];
 
-    int t = std::min(256, cols);
+    int t = 32;
+    while (t < cols && t < 256) t <<= 1;
     MTLSize grid_size = MTLSizeMake(rows, 1, 1);
     MTLSize tg_size = MTLSizeMake(t, 1, 1);
     [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:tg_size];
@@ -675,8 +683,8 @@ void fused_causal_softmax(half* scores, int n_heads, int seq_len) {
     [enc setBytes:&seq_len length:sizeof(int) atIndex:1];
 
     int total_rows = n_heads * seq_len;
-    int t = std::min(256, seq_len);
-    if (t < 32) t = 32;
+    int t = 32;
+    while (t < seq_len && t < 256) t <<= 1;
     MTLSize grid_size = MTLSizeMake(total_rows, 1, 1);
     MTLSize tg_size = MTLSizeMake(t, 1, 1);
     [enc dispatchThreadgroups:grid_size threadsPerThreadgroup:tg_size];
