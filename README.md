@@ -146,7 +146,7 @@ make test
 
 `tests/test_kernels.cpp` 会独立实现 CPU 参考，并校验 RMSNorm、RoPE、GQA KV transpose/repeat、SwiGLU、causal softmax、transpose 以及 MPS/cuBLAS GEMM 的数值结果。
 
-`tests/test_model_loader.cpp` 不下载真实模型，而是生成 tiny synthetic safetensors 文件，覆盖：单文件、`model.safetensors.index.json` 分片、legacy 分片、F16/BF16/F32 反序列化、缺权重报错、shape 不匹配报错、不支持 dtype 报错，以及 config/layer 边界校验。
+`tests/test_layer_forward.cpp` 使用 tiny synthetic weights 跑完整单层 forward，校验 residual/normalization/workspace 布线。\n\n`tests/test_model_loader.cpp` 不下载真实模型，而是生成 tiny synthetic safetensors 文件，覆盖：单文件、`model.safetensors.index.json` 分片、legacy 分片、F16/BF16/F32 反序列化、缺权重报错、shape 不匹配报错、不支持 dtype 报错，以及 config/layer 边界校验。
 
 > 当前仓库仍是 Qwen2.5 单层 forward demo：尚未覆盖完整模型、KV cache 与端到端生成。与 PyTorch 逐层全模型对齐是下一阶段目标。
 

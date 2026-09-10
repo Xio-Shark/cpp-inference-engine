@@ -11,7 +11,7 @@ SRCS = src/tensor_metal.mm \
        src/main.cpp
 
 TARGET = tiny_inference
-TEST_TARGETS = test_kernels test_model_loader
+TEST_TARGETS = test_kernels test_model_loader test_layer_forward
 
 all: $(TARGET)
 
@@ -24,9 +24,13 @@ test_kernels: tests/test_kernels.cpp src/tensor_metal.mm src/kernels_metal.mm
 test_model_loader: tests/test_model_loader.cpp src/tensor_metal.mm src/kernels_metal.mm src/safetensors.cpp src/weight_loader.cpp src/transformer.cpp
 	$(CXX) $(CXXFLAGS) tests/test_model_loader.cpp src/tensor_metal.mm src/kernels_metal.mm src/safetensors.cpp src/weight_loader.cpp src/transformer.cpp $(LDFLAGS) -o $@
 
+test_layer_forward: tests/test_layer_forward.cpp src/tensor_metal.mm src/kernels_metal.mm src/transformer.cpp
+	$(CXX) $(CXXFLAGS) tests/test_layer_forward.cpp src/tensor_metal.mm src/kernels_metal.mm src/transformer.cpp $(LDFLAGS) -o $@
+
 test: $(TEST_TARGETS)
 	./test_kernels
 	./test_model_loader
+	./test_layer_forward
 
 clean:
 	rm -f $(TARGET) $(TEST_TARGETS)

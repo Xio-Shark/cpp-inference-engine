@@ -4,3 +4,4 @@ blog_从零实现C++推理引擎.md
 tiny_inference
 test_kernels
 test_model_loader
+test_layer_forward

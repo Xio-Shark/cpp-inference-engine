@@ -88,4 +88,8 @@ if(TINY_INFERENCE_BUILD_TESTS)
     add_executable(test_model_loader tests/test_model_loader.cpp)
     target_link_libraries(test_model_loader PRIVATE tiny_inference_lib)
     add_test(NAME model_loader COMMAND test_model_loader)
+
+    add_executable(test_layer_forward tests/test_layer_forward.cpp)
+    target_link_libraries(test_layer_forward PRIVATE tiny_inference_lib)
+    add_test(NAME layer_forward COMMAND test_layer_forward)
 endif()
