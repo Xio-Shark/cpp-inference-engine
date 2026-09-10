@@ -9,7 +9,8 @@
 - **多后端加速体系**：
   - **macOS (Apple Silicon)**：Apple 原生 Metal Compute Shaders (MSL) + MetalPerformanceShaders (MPS) FP16 矩阵计算，基于 Unified Memory（统一内存架构）实现 CPU/GPU 零拷贝
   - **Linux (NVIDIA)**：CUDA Custom Kernels + cuBLAS `cublasHgemm` / `cublasHgemmStridedBatched`
-- **模型格式解析**：safetensors 二进制格式（mmap 零拷贝加载，支持 BF16/FP16 自动转换）
+- **模型格式解析**：safetensors 二进制格式（mmap 零拷贝加载，支持 FP16/BF16 自动转换，FP32 降精度加载）
+- **权重加载健壮性**：支持单文件 `model.safetensors`、`model.safetensors.index.json` 分片索引，以及 legacy `model-*.safetensors` 分片；加载时校验 9 个权重是否齐全、shape 是否匹配
 - **Transformer 架构**：Pre-norm + GQA (Grouped-Query Attention) + SwiGLU MLP + RoPE 位置编码
 
 ## 架构
@@ -90,6 +91,7 @@ cpp-inference-engine/
 │   ├── device_utils.h          跨平台设备上下文 (MTLDevice/cublasHandle) 与半精度 half 抽象
 │   ├── tensor.h                跨平台 FP16 GPU Tensor (RAII，move-only，统一内存)
 │   ├── safetensors.h           safetensors 解析器 (mmap + JSON)
+│   ├── weight_loader.h         权重文件解析、单层权重加载与 shape 校验
 │   ├── kernels.h               跨平台计算算子接口声明
 │   ├── transformer.h           TransformerConfig + TransformerLayer 核心抽象
 │   ├── cuda_utils.cuh          [兼容层] CUDA 头文件重定向
@@ -104,6 +106,7 @@ cpp-inference-engine/
 │   ├── tensor.cu               Linux CUDA cudaMalloc 内存管理实现
 │   ├── transformer.cpp         跨平台单层 Transformer Forward Pass (GQA + SwiGLU)
 │   ├── safetensors.cpp         跨平台 safetensors 权重零拷贝解析
+│   ├── weight_loader.cpp       单文件/index/分片解析与 9 权重校验
 │   └── main.cpp                CLI 入口 + 跨平台计时 Benchmark
 └── README.md
 ```
@@ -142,6 +145,8 @@ make test
 ```
 
 `tests/test_kernels.cpp` 会独立实现 CPU 参考，并校验 RMSNorm、RoPE、GQA KV transpose/repeat、SwiGLU、causal softmax、transpose 以及 MPS/cuBLAS GEMM 的数值结果。
+
+`tests/test_model_loader.cpp` 不下载真实模型，而是生成 tiny synthetic safetensors 文件，覆盖：单文件、`model.safetensors.index.json` 分片、legacy 分片、缺权重报错、shape 不匹配报错，以及 config/layer 边界校验。
 
 > 当前仓库仍是 Qwen2.5 单层 forward demo：尚未覆盖完整模型、KV cache 与端到端生成。与 PyTorch 逐层全模型对齐是下一阶段目标。
 

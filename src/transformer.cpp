@@ -20,6 +20,7 @@ TransformerConfig TransformerConfig::from_json(const std::string& path) {
     c.num_kv_heads      = j.value("num_key_value_heads", c.num_kv_heads);
     c.head_dim          = j.value("head_dim", c.head_dim);
     c.vocab_size        = j.value("vocab_size", c.vocab_size);
+    c.num_hidden_layers = j.value("num_hidden_layers", c.num_hidden_layers);
     c.rms_norm_eps      = j.value("rms_norm_eps", c.rms_norm_eps);
     c.rope_theta        = j.value("rope_theta", c.rope_theta);
     return c;

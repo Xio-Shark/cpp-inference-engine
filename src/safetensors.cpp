@@ -31,9 +31,16 @@ SafetensorsFile::~SafetensorsFile() {
 void SafetensorsFile::parse() {
     auto* base = static_cast<const uint8_t*>(map_);
 
+    if (file_sz_ < 8) {
+        throw std::runtime_error("safetensors file too small: " + path_);
+    }
+
     // First 8 bytes: little-endian uint64 header length
     uint64_t hdr_len = 0;
     std::memcpy(&hdr_len, base, 8);
+    if (hdr_len > file_sz_ - 8) {
+        throw std::runtime_error("invalid safetensors header length: " + path_);
+    }
     data_start_ = 8 + hdr_len;
 
     std::string json_str(reinterpret_cast<const char*>(base + 8), hdr_len);
@@ -46,8 +53,13 @@ void SafetensorsFile::parse() {
         m.dtype = val["dtype"].get<std::string>();
         for (auto& s : val["shape"]) m.shape.push_back(s.get<int>());
         auto off = val["data_offsets"];
-        m.offset = off[0].get<size_t>();
-        m.nbytes = off[1].get<size_t>() - m.offset;
+        const size_t begin = off[0].get<size_t>();
+        const size_t end = off[1].get<size_t>();
+        if (begin > end || end > file_sz_ - data_start_) {
+            throw std::runtime_error("invalid tensor data range for " + key + " in " + path_);
+        }
+        m.offset = begin;
+        m.nbytes = end - begin;
 
         meta_[key] = std::move(m);
     }
@@ -59,35 +71,44 @@ GpuTensor SafetensorsFile::load_tensor(const std::string& name) const {
         throw std::runtime_error("tensor not found: " + name);
 
     const auto& m = it->second;
-    GpuTensor t(m.shape);
-    size_t numel = t.numel();
-
-    auto* src = static_cast<const uint8_t*>(map_) + data_start_ + m.offset;
-
-    if (m.dtype == "BF16") {
-        // BF16 → FP32 → FP16 conversion on host
-        auto* bf16_data = reinterpret_cast<const uint16_t*>(src);
-        std::vector<uint16_t> fp16_buf(numel);
-        for (size_t i = 0; i < numel; ++i) {
-            // BF16 → FP32: left-shift 16 bits (BF16 = upper 16 bits of FP32)
-            uint32_t fp32_bits = static_cast<uint32_t>(bf16_data[i]) << 16;
-            float fval;
-            std::memcpy(&fval, &fp32_bits, sizeof(float));
-            // FP32 → FP16: extract sign, exponent, mantissa
-            uint32_t f = fp32_bits;
-            uint16_t sign = (f >> 16) & 0x8000;
-            int exp = ((f >> 23) & 0xFF) - 127 + 15;
-            uint16_t mant = (f >> 13) & 0x03FF;
-            uint16_t h;
-            if (exp <= 0)       h = sign;                // underflow → zero
-            else if (exp >= 31) h = sign | 0x7C00;       // overflow → inf
-            else                h = sign | (exp << 10) | mant;
-            fp16_buf[i] = h;
-        }
-        t.load_from_host(reinterpret_cast<const half*>(fp16_buf.data()), numel);
+    size_t element_bytes = 0;
+    if (m.dtype == "F16" || m.dtype == "BF16") {
+        element_bytes = sizeof(half);
+    } else if (m.dtype == "F32") {
+        element_bytes = sizeof(float);
     } else {
-        // F16 direct load
+        throw std::runtime_error(
+            "unsupported tensor dtype for " + name + ": " + m.dtype + " in " + path_);
+    }
+
+    GpuTensor t(m.shape);
+    const size_t numel = t.numel();
+    if (m.nbytes != numel * element_bytes) {
+        throw std::runtime_error(
+            "tensor byte size mismatch for " + name + " in " + path_);
+    }
+
+    const auto* src = static_cast<const uint8_t*>(map_) + data_start_ + m.offset;
+
+    if (m.dtype == "F16") {
         t.load_from_host(reinterpret_cast<const half*>(src), numel);
+    } else if (m.dtype == "BF16") {
+        const auto* bf16_data = reinterpret_cast<const uint16_t*>(src);
+        std::vector<half> converted(numel);
+        for (size_t i = 0; i < numel; ++i) {
+            uint32_t fp32_bits = static_cast<uint32_t>(bf16_data[i]) << 16;
+            float value = 0.0f;
+            std::memcpy(&value, &fp32_bits, sizeof(float));
+            converted[i] = __float2half(value);
+        }
+        t.load_from_host(converted.data(), numel);
+    } else {
+        const auto* fp32_data = reinterpret_cast<const float*>(src);
+        std::vector<half> converted(numel);
+        for (size_t i = 0; i < numel; ++i) {
+            converted[i] = __float2half(fp32_data[i]);
+        }
+        t.load_from_host(converted.data(), numel);
     }
     return t;
 }

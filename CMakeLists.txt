@@ -26,6 +26,7 @@ if(APPLE)
         src/tensor_metal.mm
         src/kernels_metal.mm
         src/safetensors.cpp
+        src/weight_loader.cpp
         src/transformer.cpp
     )
 
@@ -55,6 +56,7 @@ else()
     set(LIB_SOURCES
         src/tensor.cu
         src/safetensors.cpp
+        src/weight_loader.cpp
         src/kernels.cu
         src/transformer.cpp
     )
@@ -82,4 +84,8 @@ if(TINY_INFERENCE_BUILD_TESTS)
     add_executable(test_kernels tests/test_kernels.cpp)
     target_link_libraries(test_kernels PRIVATE tiny_inference_lib)
     add_test(NAME kernel_correctness COMMAND test_kernels)
+
+    add_executable(test_model_loader tests/test_model_loader.cpp)
+    target_link_libraries(test_model_loader PRIVATE tiny_inference_lib)
+    add_test(NAME model_loader COMMAND test_model_loader)
 endif()

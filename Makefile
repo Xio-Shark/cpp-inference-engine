@@ -6,25 +6,29 @@ LDFLAGS ?= -framework Metal -framework Foundation -framework MetalPerformanceSha
 SRCS = src/tensor_metal.mm \
        src/kernels_metal.mm \
        src/safetensors.cpp \
+       src/weight_loader.cpp \
        src/transformer.cpp \
        src/main.cpp
 
 TARGET = tiny_inference
-TEST_TARGET = test_kernels
-TEST_SRCS = tests/test_kernels.cpp
+TEST_TARGETS = test_kernels test_model_loader
 
 all: $(TARGET)
 
 $(TARGET): $(SRCS)
 	$(CXX) $(CXXFLAGS) $(SRCS) $(LDFLAGS) -o $(TARGET)
 
-$(TEST_TARGET): $(TEST_SRCS) src/tensor_metal.mm src/kernels_metal.mm
-	$(CXX) $(CXXFLAGS) $(TEST_SRCS) src/tensor_metal.mm src/kernels_metal.mm $(LDFLAGS) -o $(TEST_TARGET)
+test_kernels: tests/test_kernels.cpp src/tensor_metal.mm src/kernels_metal.mm
+	$(CXX) $(CXXFLAGS) tests/test_kernels.cpp src/tensor_metal.mm src/kernels_metal.mm $(LDFLAGS) -o $@
 
-test: $(TEST_TARGET)
-	./$(TEST_TARGET)
+test_model_loader: tests/test_model_loader.cpp src/tensor_metal.mm src/kernels_metal.mm src/safetensors.cpp src/weight_loader.cpp src/transformer.cpp
+	$(CXX) $(CXXFLAGS) tests/test_model_loader.cpp src/tensor_metal.mm src/kernels_metal.mm src/safetensors.cpp src/weight_loader.cpp src/transformer.cpp $(LDFLAGS) -o $@
+
+test: $(TEST_TARGETS)
+	./test_kernels
+	./test_model_loader
 
 clean:
-	rm -f $(TARGET) $(TEST_TARGET)
+	rm -f $(TARGET) $(TEST_TARGETS)
 
 .PHONY: all test clean
