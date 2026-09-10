@@ -6,10 +6,12 @@
 // exercised.
 #include "transformer.h"
 #include "weight_loader.h"
+#include "safetensors.h"
 
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -147,6 +149,28 @@ void write_config(const fs::path& path, const TransformerConfig& cfg) {
     write_text(path, json.dump(2));
 }
 
+void write_raw_safetensors(const fs::path& path,
+                           const std::string& name,
+                           const std::vector<int>& shape,
+                           const std::string& dtype,
+                           const std::vector<uint8_t>& bytes) {
+    nlohmann::json header = nlohmann::json::object();
+    header[name] = {
+        {"dtype", dtype},
+        {"shape", shape},
+        {"data_offsets", {0, bytes.size()}},
+    };
+    const std::string header_text = header.dump();
+    const uint64_t header_length = static_cast<uint64_t>(header_text.size());
+    std::ofstream output(path, std::ios::binary);
+    if (!output) throw std::runtime_error("cannot write " + path.string());
+    output.write(reinterpret_cast<const char*>(&header_length), sizeof(header_length));
+    output.write(header_text.data(), static_cast<std::streamsize>(header_text.size()));
+    if (!bytes.empty()) {
+        output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+}
+
 std::vector<SyntheticTensor> make_layer_tensors(const TransformerConfig& cfg, int layer_idx) {
     const std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
     const int hidden = cfg.hidden_size;
@@ -213,6 +237,54 @@ void test_resolve_ambiguous_files() {
     write_text(dir.path / "a.safetensors", "placeholder");
     write_text(dir.path / "b.safetensors", "placeholder");
     expect_throws([&] { resolve_weight_files(dir.str()); }, "resolve ambiguous files throws");
+}
+
+void test_f32_conversion() {
+    TempDir dir("load_f32");
+    const std::vector<float> values = {1.0f, -2.5f, 0.125f, 3.0f};
+    std::vector<uint8_t> bytes(values.size() * sizeof(float));
+    std::memcpy(bytes.data(), values.data(), bytes.size());
+    write_raw_safetensors(dir.path / "model.safetensors", "w", {4}, "F32", bytes);
+
+    SafetensorsFile source((dir.path / "model.safetensors").string());
+    GpuTensor tensor = source.load_tensor("w");
+    std::vector<half> host(tensor.numel());
+    tensor.copy_to_host(host.data(), host.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+        check(__half2float(host[i]) == __half2float(__float2half(values[i])),
+              "F32 conversion element " + std::to_string(i));
+    }
+}
+
+void test_bf16_conversion() {
+    TempDir dir("load_bf16");
+    const std::vector<float> values = {1.0f, -2.0f, 0.5f, 0.25f};
+    std::vector<uint16_t> raw(values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &values[i], sizeof(float));
+        raw[i] = static_cast<uint16_t>(bits >> 16);
+    }
+    std::vector<uint8_t> bytes(raw.size() * sizeof(uint16_t));
+    std::memcpy(bytes.data(), raw.data(), bytes.size());
+    write_raw_safetensors(dir.path / "model.safetensors", "w", {4}, "BF16", bytes);
+
+    SafetensorsFile source((dir.path / "model.safetensors").string());
+    GpuTensor tensor = source.load_tensor("w");
+    std::vector<half> host(tensor.numel());
+    tensor.copy_to_host(host.data(), host.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+        check(__half2float(host[i]) == __half2float(__float2half(values[i])),
+              "BF16 conversion element " + std::to_string(i));
+    }
+}
+
+void test_unsupported_dtype_fails() {
+    TempDir dir("load_unsupported");
+    const std::vector<uint8_t> bytes(8, 0);
+    write_raw_safetensors(dir.path / "model.safetensors", "w", {1}, "I64", bytes);
+    SafetensorsFile source((dir.path / "model.safetensors").string());
+    expect_throws([&] { source.load_tensor("w"); }, "unsupported dtype throws");
 }
 
 void check_layer_shapes(TransformerLayer& layer,
@@ -327,6 +399,10 @@ int main() {
         test_resolve_legacy_shards();
         test_resolve_missing();
         test_resolve_ambiguous_files();
+
+        test_f32_conversion();
+        test_bf16_conversion();
+        test_unsupported_dtype_fails();
 
         test_load_single_file(ctx);
         test_load_index_shards(ctx);
