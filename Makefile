@@ -10,13 +10,21 @@ SRCS = src/tensor_metal.mm \
        src/main.cpp
 
 TARGET = tiny_inference
+TEST_TARGET = test_kernels
+TEST_SRCS = tests/test_kernels.cpp
 
 all: $(TARGET)
 
 $(TARGET): $(SRCS)
 	$(CXX) $(CXXFLAGS) $(SRCS) $(LDFLAGS) -o $(TARGET)
 
-clean:
-	rm -f $(TARGET)
+$(TEST_TARGET): $(TEST_SRCS) src/tensor_metal.mm src/kernels_metal.mm
+	$(CXX) $(CXXFLAGS) $(TEST_SRCS) src/tensor_metal.mm src/kernels_metal.mm $(LDFLAGS) -o $(TEST_TARGET)
 
-.PHONY: all clean
+test: $(TEST_TARGET)
+	./$(TEST_TARGET)
+
+clean:
+	rm -f $(TARGET) $(TEST_TARGET)
+
+.PHONY: all test clean

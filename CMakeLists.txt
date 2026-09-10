@@ -74,3 +74,12 @@ endif()
 # Main executable
 add_executable(tiny_inference src/main.cpp)
 target_link_libraries(tiny_inference PRIVATE tiny_inference_lib)
+
+option(TINY_INFERENCE_BUILD_TESTS "Build kernel correctness tests" ON)
+
+if(TINY_INFERENCE_BUILD_TESTS)
+    enable_testing()
+    add_executable(test_kernels tests/test_kernels.cpp)
+    target_link_libraries(test_kernels PRIVATE tiny_inference_lib)
+    add_test(NAME kernel_correctness COMMAND test_kernels)
+endif()

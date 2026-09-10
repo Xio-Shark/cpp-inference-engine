@@ -117,7 +117,7 @@ int main(int argc, char** argv) {
 
     // Warmup
     printf("Running warmup...\n");
-    auto out = layer.forward(input, S);
+    GpuTensor& out = layer.forward(input, S);
     ctx.synchronize();
 
     // Benchmark
@@ -125,7 +125,7 @@ int main(int argc, char** argv) {
     ctx.synchronize();
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < ITERS; ++i) {
-        out = layer.forward(input, S);
+        layer.forward(input, S);
     }
     ctx.synchronize();
     auto t1 = std::chrono::high_resolution_clock::now();

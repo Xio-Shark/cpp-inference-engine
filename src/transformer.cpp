@@ -37,11 +37,15 @@ void TransformerLayer::linear(half* out, const half* in,
 
 // ---- Workspace allocation ----
 void TransformerLayer::ensure_workspace(int S) {
+    int H = cfg_.hidden_size;
+
     if (workspace_seq_len_ >= S && workspace_.data() != nullptr) {
+        if (output_.numel() != static_cast<size_t>(S) * H) {
+            output_ = GpuTensor({S, H});
+        }
         return;
     }
 
-    int H = cfg_.hidden_size;
     int nh = cfg_.num_heads;
     int nkv = cfg_.num_kv_heads;
     int D = cfg_.head_dim;
@@ -82,6 +86,9 @@ void TransformerLayer::ensure_workspace(int S) {
     total_elements = ((total_elements + 255) / 256) * 256;
 
     workspace_ = GpuTensor({static_cast<int>(total_elements)});
+    if (output_.numel() != static_cast<size_t>(S) * H) {
+        output_ = GpuTensor({S, H});
+    }
     workspace_seq_len_ = S;
 }
 
@@ -168,8 +175,8 @@ void TransformerLayer::mlp_out(half* out, const half* x_normed, int S) {
 }
 
 // ---- Full layer forward ----
-GpuTensor TransformerLayer::forward(const GpuTensor& input,
-                                     int S, int off) {
+GpuTensor& TransformerLayer::forward(const GpuTensor& input,
+                                      int S, int off) {
     int H = cfg_.hidden_size;
     int n = S * H;
 
@@ -199,9 +206,8 @@ GpuTensor TransformerLayer::forward(const GpuTensor& input,
     half* ptr_mlp_out = ptr_scratch + static_cast<size_t>(S) * (2 * cfg_.intermediate_size);
     mlp_out(ptr_mlp_out, ptr_normed, S);
 
-    // 6. Residual 2: output = res1 + mlp_out
-    GpuTensor output({S, H});
-    ewise_add(output.data(), ptr_res1, ptr_mlp_out, n);
-    return output;
+    // 6. Residual 2: output_ = res1 + mlp_out (reuse the preallocated buffer)
+    ewise_add(output_.data(), ptr_res1, ptr_mlp_out, n);
+    return output_;
 }
 

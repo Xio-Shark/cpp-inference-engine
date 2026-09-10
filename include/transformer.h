@@ -29,8 +29,10 @@ class TransformerLayer {
 public:
     TransformerLayer(const TransformerConfig& cfg, DeviceContext& ctx);
 
-    /// input: [seq_len, hidden] → output: [seq_len, hidden]
-    GpuTensor forward(const GpuTensor& input, int seq_len, int pos_offset = 0);
+    /// input: [seq_len, hidden] -> output: [seq_len, hidden].
+    /// The returned reference points at an internal, reusable output buffer.
+    /// It stays valid until the next call to forward() with a different seq_len.
+    GpuTensor& forward(const GpuTensor& input, int seq_len, int pos_offset = 0);
 
     LayerWeights& weights() { return w_; }
 
@@ -45,5 +47,6 @@ private:
     DeviceContext& ctx_;
     LayerWeights w_;
     GpuTensor workspace_;
+    GpuTensor output_;
     int workspace_seq_len_ = 0;
 };
