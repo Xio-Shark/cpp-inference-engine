@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  macos-build:
+    name: macOS Metal build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build CLI
+        run: make -B
+      - name: Build test binaries
+        run: make -B test_kernels test_model_loader
+
+  linux-cuda-build:
+    name: Linux CUDA build
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    steps:
+      - name: Install build tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: apt-get update && apt-get install -y cmake git
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=80
+      - name: Build
+        run: cmake --build build -j2
