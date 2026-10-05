@@ -1,0 +1,9 @@
+build/
+build-*/
+.cache/
+compile_commands.json
+dump.rdb
+*.log
+.DS_Store
+.idea/
+.vscode/
